@@ -6,6 +6,7 @@
 
 import numpy as np
 import matplotlib.pyplot as pyplot
+import random, csv
 
 class Node:
     """
@@ -14,7 +15,7 @@ class Node:
     def __init__(self, q, parent=None):
         assert (len(q) == 2)
         self.q = q
-        self.parent = None
+        self.parent = parent
 
 class Rectangle:
     """
@@ -126,35 +127,217 @@ class Planner:
     Path planner for double pendulum. 
     Rapidly exploring random tree (RRT) is used here with identification.
     """
-    def __init__(self, robot, obstacles, step_size, goal_rate):
+    def __init__(self, robot, obstacles, step_size, goal_rate, max_iter=1000):
         self.robot = robot
         self.obstacles = obstacles
 
         assert (step_size > 0)
         assert (goal_rate > 0)
+        assert (goal_rate < 1)
         self.step = step_size
         self.goal_rate = goal_rate
+        self.max_iter = max_iter
 
         self.nodes = [Node(self.robot.q0)]
         self.goal = self.robot.qt
 
+        random.seed(10)
+
+    def distance(self, q1, q2):
+        """
+        Compute the Eucledian Norm between two configurations. 
+        Special treatment is needed on boundary due to identification (0 = 2pi)
+        """
+        d0 = min(abs(q2[0]-q1[0]), abs(q2[0]-q1[0]+2*np.pi), abs(q2[0]-q1[0]-2*np.pi))
+        d1 = min(abs(q2[1]-q1[1]), abs(q2[1]-q1[1]+2*np.pi), abs(q2[1]-q1[1]-2*np.pi))
+        return np.linalg.norm([d0, d1])
+
+    def getClosestNode(self, q):
+        """
+        Get the node closest to the new node q
+        """
+        dist = np.inf
+        closest = None
+
+        for node in self.nodes:
+            dist_new = self.distance(q, node.q)
+            if dist_new < dist:
+                closest = node
+                dist = dist_new
+        
+        return closest
+
+    def getDirection(self, q1, q2):
+        """
+        Get the direction of movement from q1 to q2
+        A unit vector is returned.
+        """
+        direction = np.array(
+            [self.diff1D(q1[0], q2[0]), self.diff1D(q1[1], q2[1])]
+        )
+        return direction / np.linalg.norm(direction)
+
+    def diff1D(self, x, y):
+        """
+        Helper function used by getDirection
+        """
+        diff = y-x
+        diff_pos = y+2*np.pi-x
+        diff_neg = x+2*np.pi-y
+
+        if abs(diff) <= abs(diff_pos) and abs(diff) <= abs(diff_neg):
+            return diff
+        elif abs(diff_pos) <= abs(diff_neg):
+            return diff_pos
+        else:
+            return -diff_neg
+
+    def planning(self, plot=False):
+        """
+        Rapidly exploring random tree (RRT)
+        The method tries newly sampled direction until:
+            1. The new node is close to the target in C space
+            2. The number of nodes exceed maximum
+        """
+        iter = 0
+        while iter <= self.max_iter:
+            iter += 1
+
+            if (random.random() <= self.goal_rate):
+                # New direction points to goal
+                q_new = self.goal
+            else:
+                # Sample uniformly between [0, 2pi]
+                q_new = [random.uniform(0, 2*np.pi), random.uniform(0, 2*np.pi)]
+            
+            closest = self.getClosestNode(q_new)
+            q_old = closest.q
+            delta = self.getDirection(q_old, q_new)*self.step
+            if (np.isnan(delta).any()):
+                print ("Nan encountered. Start the next iteration.")
+                continue
+            q_new = self.roundOff([delta[0] + q_old[0], delta[1] + q_old[1]])
+            
+            newNode = Node(
+                parent = closest,
+                q = q_new
+            )
+
+            # Check collision
+            if self.robot.collide(q_new, self.obstacles):
+                print ("Collision at q =", q_new, ". Point discarded.")
+                if plot:
+                    self.plotInfeasiblePoint(newNode)
+                continue
+            else:
+                print ("Safe at q =", q_new, ". Point accepted.")
+                if plot:
+                    self.plotFeasiblePoint(newNode)
+                self.nodes.append(newNode)
+
+            # Check goal
+            d = self.distance(q_new, self.goal)
+            print ("Distance to goal", d)
+            if d < self.step:
+                # Move to the goal and return the path
+                print ("Goal reached!")
+                goalNode = Node(
+                    parent = newNode,
+                    q = self.goal
+                )
+                self.nodes.append(goalNode)
+                if plot:
+                    self.plotFeasiblePoint(goalNode)
+                pyplot.savefig("C_Space.png")
+                return self.generatePath()
+
+        raise RuntimeError("Unable to find a path. Please increase the number of iteration.")
     
+    def plotInfeasiblePoint(self, node):
+        """
+        Plot a red line between q_old and q_new
+        """
+        pyplot.plot(node.q[0], node.q[1], 'rx')
+        pyplot.title("Configuration Space of Double Pendulum")
+        pyplot.xlim(0, 2*np.pi)
+        pyplot.ylim(0, 2*np.pi)
+        pyplot.pause(0.001)
+
+    def plotFeasiblePoint(self, node):
+        """
+        Plot a green line between q_old and q_new
+        """
+        pyplot.plot(node.q[0], node.q[1], 'go')
+        pyplot.title("Configuration Space of Double Pendulum")
+        pyplot.xlim(0, 2*np.pi)
+        pyplot.ylim(0, 2*np.pi)
+        pyplot.pause(0.001)
+    
+    def generatePath(self):
+        """
+        Generate the path from self.nodes
+        """
+        node = self.nodes[-1]
+        disp = []
+
+        while node and node.parent:
+            q0 = node.parent.q
+            q1 = node.q
+            disp.append(
+                [self.diff1D(q0[0], q1[0]),
+                 self.diff1D(q0[1], q1[1])]
+            )
+            node = node.parent
+        disp.reverse()
+
+        # Compute q without identification
+        # This should be the input for MotionSolve
+        path = [self.robot.q0]
+        for d_i in disp:
+            q0 = path[-1]
+            q1 = [q0[0]+d_i[0], q0[1]+d_i[1]]
+            path.append(q1)
+
+        time = np.linspace(0, 10, len(path))
+        with open('double_link.csv', 'w', newline='') as csvfile:
+            writer = csv.writer(csvfile, delimiter=',', quotechar='|', quoting=csv.QUOTE_MINIMAL)
+            for i in range(len(path)):
+                writer.writerow([time[i], path[i][0], path[i][1]])
+
+        return path
+
+    def roundOff(self, q):
+        """
+        Make sure q_i in [0, 2pi]
+        """
+        if q[0] > 2*np.pi:
+            q[0] -= 2*np.pi
+        elif q[0] < 0:
+            q[0] += 2*np.pi
+        if q[1] > 2*np.pi:
+            q[1] -= 2*np.pi
+        elif q[1] < 0:
+            q[1] += 2*np.pi
+        return q
 
 if __name__ == "__main__":
-    # rect = Rectangle(10, 1)
-    # rect.setPosition(5,5,np.pi/4)
-    # mesh = rect.mesh()
-    # for point in mesh:
-    #     pyplot.plot([point[0]], [point[1]], 'ro')
-    # pyplot.show()
-    
-    rect1 = Rectangle(1, 0.1)
-    rect2 = Rectangle(1, 0.1)
-    robot = DoublePendulum([0,0], [1,1], [rect1, rect2])
-    obs1 = Circle(0.5, [1, 1])
-    obs2 = Circle(0.5, [1,-1])
+    # Create robot
+    rect1 = Rectangle(1, 0.05)
+    rect2 = Rectangle(1, 0.05)
+    robot = DoublePendulum([0,0], [np.pi/2, 0], [rect1, rect2])
 
-    print ("Check if there is any collision")
-    print (robot.collide([0,np.pi/2], [obs1, obs2]))
-    print (robot.collide([0,np.pi/3], [obs1, obs2]))
-    print (robot.collide([0,np.pi/6], [obs1, obs2]))
+    # Create obstacles
+    circle1 = Circle(r=0.5, pos=[1,1])
+    circle2 = Circle(r=0.5, pos=[-1, 1.6])
+
+    # Run Motion Planner
+    planner = Planner(
+        robot = robot,
+        obstacles = [circle1, circle2],
+        # obstacles = [],
+        step_size = 0.1,
+        goal_rate = 0.1,
+        max_iter = 20000,
+    )
+    path = planner.planning(plot=True)
+    print (path)
